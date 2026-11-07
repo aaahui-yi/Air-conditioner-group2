@@ -1,0 +1,628 @@
+/*
+ * 红外空调控制模块 —— 单文件整合版（组员 B）
+ *
+ * 整合来源（本仓库 main 分支）：
+ *   firmware/inc/human_sensor.h  + firmware/src/human_sensor.c   （组员 A 的人体检测接口 / PC 仿真实现）
+ *   firmware/inc/ir_driver.h    + firmware/src/ir_driver.c      （红外发射驱动）
+ *   firmware/hal/ir_capture.h   + firmware/hal/ir_capture.c     （PC 仿真红外接收器）
+ *   firmware/inc/ac_control.h   + firmware/src/ac_control.c     （空调状态机与有人/无人联动）
+ *   firmware/src/main.c                                        （联动演示）
+ *   tests/test_human_sensor.c / test_ir_transmit.c / test_occupancy.c（自测）
+ *
+ * 编译（MinGW-W64 GCC / 任意 C11 编译器，仅依赖标准库）：
+ *   gcc -std=c11 -Wall -Wextra -Werror -pedantic ir_ac_all_in_one.c -o ir_ac_all_in_one.exe
+ * 运行：
+ *   ir_ac_all_in_one.exe
+ *
+ * 与原仓库的差异：头文件已内联、内部函数改为 static、头文件守卫去除；
+ * 三个自测与演示程序合并进同一个 main()。逻辑与仓库实现完全一致。
+ * 真机接入：把 ir_sink_t 换成 GPIO/PWM 载波实现，把 human_sensor_* 换成组员 A 的实际驱动。
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ==================== 1. 组员 A：人体检测信号接口 ==================== */
+
+typedef enum {
+    HUMAN_ABSENT = 0,
+    HUMAN_PRESENT = 1
+} human_state_t;
+
+typedef struct {
+    human_state_t state;
+    uint8_t confidence;
+    uint32_t timestamp_ms;
+} human_detection_signal_t;
+
+static human_detection_signal_t s_latest;
+static bool s_has_sample;
+
+static int human_sensor_read(human_detection_signal_t *out)
+{
+    if (out == NULL || !s_has_sample) {
+        return -1;
+    }
+    *out = s_latest;
+    return 0;
+}
+
+static void human_sensor_feed(human_state_t state, uint8_t confidence, uint32_t timestamp_ms)
+{
+    if (state != HUMAN_ABSENT && state != HUMAN_PRESENT) {
+        return;
+    }
+    if (confidence > 100U) {
+        return;
+    }
+    s_latest.state = state;
+    s_latest.confidence = confidence;
+    s_latest.timestamp_ms = timestamp_ms;
+    s_has_sample = true;
+}
+
+static void human_sensor_reset(void)
+{
+    memset(&s_latest, 0, sizeof(s_latest));
+    s_has_sample = false;
+}
+
+/* ==================== 2. 红外发射驱动 ==================== */
+
+#define IR_CARRIER_HZ 38000U
+#define IR_LEADER_MARK_US 9000U
+#define IR_LEADER_SPACE_US 4500U
+#define IR_BIT_MARK_US 560U
+#define IR_ZERO_SPACE_US 560U
+#define IR_ONE_SPACE_US 1690U
+#define IR_STOP_MARK_US 560U
+#define IR_FRAME_BITS 32U
+#define IR_AC_ADDRESS 0x00FFU
+
+typedef enum {
+    IR_OK = 0,
+    IR_ERR_INVALID_ARG = -1,
+    IR_ERR_BUSY = -2
+} ir_status_t;
+
+typedef enum {
+    AC_IR_CMD_POWER_ON = 0x01U,
+    AC_IR_CMD_POWER_OFF = 0x02U
+} ac_ir_command_t;
+
+typedef struct {
+    void (*carrier_on)(void *ctx, uint32_t duration_us);
+    void (*carrier_off)(void *ctx, uint32_t duration_us);
+    void *ctx;
+} ir_sink_t;
+
+typedef struct {
+    uint16_t address;
+    uint8_t command;
+} ir_frame_t;
+
+static uint8_t ir_frame_inverted_command(uint8_t command)
+{
+    return (uint8_t)(~command & 0xFFU);
+}
+
+static void emit_bit(const ir_sink_t *sink, uint8_t bit)
+{
+    sink->carrier_on(sink->ctx, IR_BIT_MARK_US);
+    sink->carrier_off(sink->ctx, bit ? IR_ONE_SPACE_US : IR_ZERO_SPACE_US);
+}
+
+static ir_status_t ir_driver_send_frame(const ir_sink_t *sink, const ir_frame_t *frame)
+{
+    uint8_t bytes[4];
+    uint32_t byte_index;
+    uint32_t bit_index;
+
+    if (sink == NULL || frame == NULL || sink->carrier_on == NULL || sink->carrier_off == NULL) {
+        return IR_ERR_INVALID_ARG;
+    }
+
+    bytes[0] = (uint8_t)(frame->address & 0xFFU);
+    bytes[1] = (uint8_t)((frame->address >> 8) & 0xFFU);
+    bytes[2] = frame->command;
+    bytes[3] = ir_frame_inverted_command(frame->command);
+
+    sink->carrier_on(sink->ctx, IR_LEADER_MARK_US);
+    sink->carrier_off(sink->ctx, IR_LEADER_SPACE_US);
+
+    for (byte_index = 0; byte_index < 4U; ++byte_index) {
+        for (bit_index = 0; bit_index < 8U; ++bit_index) {
+            emit_bit(sink, (uint8_t)((bytes[byte_index] >> bit_index) & 0x01U));
+        }
+    }
+
+    sink->carrier_on(sink->ctx, IR_STOP_MARK_US);
+    return IR_OK;
+}
+
+static ir_status_t ir_driver_send_power(const ir_sink_t *sink, uint16_t address, ac_ir_command_t command)
+{
+    ir_frame_t frame;
+
+    if (command != AC_IR_CMD_POWER_ON && command != AC_IR_CMD_POWER_OFF) {
+        return IR_ERR_INVALID_ARG;
+    }
+    frame.address = address;
+    frame.command = (uint8_t)command;
+    return ir_driver_send_frame(sink, &frame);
+}
+
+/* ==================== 3. PC 仿真红外接收器 ==================== */
+
+#define IR_CAPTURE_MAX_SEGMENTS 128U
+#define IR_CAPTURE_TOLERANCE_US 120U
+
+typedef enum {
+    IR_SEG_MARK = 0,
+    IR_SEG_SPACE = 1
+} ir_segment_kind_t;
+
+typedef struct {
+    ir_segment_kind_t kind;
+    uint32_t duration_us;
+} ir_segment_t;
+
+typedef struct {
+    ir_segment_t segments[IR_CAPTURE_MAX_SEGMENTS];
+    uint32_t count;
+    bool overflow;
+} ir_capture_t;
+
+static bool duration_matches(uint32_t actual, uint32_t expected)
+{
+    return actual >= expected - IR_CAPTURE_TOLERANCE_US &&
+           actual <= expected + IR_CAPTURE_TOLERANCE_US;
+}
+
+static void record(ir_capture_t *capture, ir_segment_kind_t kind, uint32_t duration_us)
+{
+    if (capture->count >= IR_CAPTURE_MAX_SEGMENTS) {
+        capture->overflow = true;
+        return;
+    }
+    capture->segments[capture->count].kind = kind;
+    capture->segments[capture->count].duration_us = duration_us;
+    capture->count++;
+}
+
+static void capture_on(void *ctx, uint32_t duration_us)
+{
+    record((ir_capture_t *)ctx, IR_SEG_MARK, duration_us);
+}
+
+static void capture_off(void *ctx, uint32_t duration_us)
+{
+    record((ir_capture_t *)ctx, IR_SEG_SPACE, duration_us);
+}
+
+static void ir_capture_init(ir_capture_t *capture)
+{
+    capture->count = 0U;
+    capture->overflow = false;
+}
+
+static ir_sink_t ir_capture_sink(ir_capture_t *capture)
+{
+    ir_sink_t sink;
+    sink.carrier_on = capture_on;
+    sink.carrier_off = capture_off;
+    sink.ctx = capture;
+    return sink;
+}
+
+static uint32_t ir_capture_count(const ir_capture_t *capture)
+{
+    return capture->count;
+}
+
+static const ir_segment_t *ir_capture_at(const ir_capture_t *capture, uint32_t index)
+{
+    if (index >= capture->count) {
+        return NULL;
+    }
+    return &capture->segments[index];
+}
+
+static bool ir_capture_overflow(const ir_capture_t *capture)
+{
+    return capture->overflow;
+}
+
+static int ir_capture_decode_frame(const ir_capture_t *capture, ir_frame_t *out)
+{
+    uint8_t bytes[4] = { 0U, 0U, 0U, 0U };
+    uint32_t bit;
+    uint32_t index;
+    const ir_segment_t *mark;
+    const ir_segment_t *space;
+
+    if (capture->overflow || capture->count != 2U + 2U * IR_FRAME_BITS + 1U) {
+        return -1;
+    }
+    if (capture->segments[0].kind != IR_SEG_MARK ||
+        !duration_matches(capture->segments[0].duration_us, IR_LEADER_MARK_US) ||
+        capture->segments[1].kind != IR_SEG_SPACE ||
+        !duration_matches(capture->segments[1].duration_us, IR_LEADER_SPACE_US)) {
+        return -1;
+    }
+
+    for (bit = 0; bit < IR_FRAME_BITS; ++bit) {
+        index = 2U + 2U * bit;
+        mark = &capture->segments[index];
+        space = &capture->segments[index + 1U];
+        if (mark->kind != IR_SEG_MARK || !duration_matches(mark->duration_us, IR_BIT_MARK_US) ||
+            space->kind != IR_SEG_SPACE) {
+            return -1;
+        }
+        if (duration_matches(space->duration_us, IR_ONE_SPACE_US)) {
+            bytes[bit / 8U] |= (uint8_t)(1U << (bit % 8U));
+        } else if (!duration_matches(space->duration_us, IR_ZERO_SPACE_US)) {
+            return -1;
+        }
+    }
+
+    mark = &capture->segments[2U + 2U * IR_FRAME_BITS];
+    if (mark->kind != IR_SEG_MARK || !duration_matches(mark->duration_us, IR_STOP_MARK_US)) {
+        return -1;
+    }
+    if (bytes[3] != ir_frame_inverted_command(bytes[2])) {
+        return -1;
+    }
+
+    out->address = (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
+    out->command = bytes[2];
+    return 0;
+}
+
+/* ==================== 4. 空调状态机与人体检测联动 ==================== */
+
+#define AC_DEFAULT_ABSENT_DELAY_MS 300000U
+#define AC_DEFAULT_MIN_COMMAND_INTERVAL_MS 1000U
+#define AC_MIN_CONFIDENCE 50U
+
+typedef enum {
+    AC_POWER_OFF = 0,
+    AC_POWER_ON = 1
+} ac_power_state_t;
+
+typedef struct {
+    ac_power_state_t power;
+    uint16_t device_address;
+    const ir_sink_t *sink;
+    uint32_t transmit_count;
+    uint32_t absent_delay_ms;
+    uint32_t min_command_interval_ms;
+    uint32_t last_transmit_ms;
+    uint32_t absent_since_ms;
+    bool absent_pending;
+} ac_controller_t;
+
+static void ac_controller_init(ac_controller_t *controller, const ir_sink_t *sink, uint16_t address)
+{
+    controller->power = AC_POWER_OFF;
+    controller->device_address = address;
+    controller->sink = sink;
+    controller->transmit_count = 0U;
+    controller->absent_delay_ms = AC_DEFAULT_ABSENT_DELAY_MS;
+    controller->min_command_interval_ms = AC_DEFAULT_MIN_COMMAND_INTERVAL_MS;
+    controller->last_transmit_ms = 0U;
+    controller->absent_since_ms = 0U;
+    controller->absent_pending = false;
+}
+
+static void ac_controller_configure(ac_controller_t *controller, uint32_t absent_delay_ms,
+                                    uint32_t min_command_interval_ms)
+{
+    controller->absent_delay_ms = absent_delay_ms;
+    controller->min_command_interval_ms = min_command_interval_ms;
+}
+
+static ir_status_t ac_controller_set_power(ac_controller_t *controller, ac_power_state_t target,
+                                           uint32_t now_ms)
+{
+    ir_status_t status;
+    ac_ir_command_t command;
+
+    if (target != AC_POWER_OFF && target != AC_POWER_ON) {
+        return IR_ERR_INVALID_ARG;
+    }
+    if (controller->power == target) {
+        return IR_OK;
+    }
+    if (controller->transmit_count > 0U &&
+        (uint32_t)(now_ms - controller->last_transmit_ms) < controller->min_command_interval_ms) {
+        return IR_ERR_BUSY;
+    }
+
+    command = target == AC_POWER_ON ? AC_IR_CMD_POWER_ON : AC_IR_CMD_POWER_OFF;
+    status = ir_driver_send_power(controller->sink, controller->device_address, command);
+    if (status != IR_OK) {
+        return status;
+    }
+
+    controller->power = target;
+    controller->transmit_count++;
+    controller->last_transmit_ms = now_ms;
+    return IR_OK;
+}
+
+static int ac_controller_on_signal(ac_controller_t *controller, const human_detection_signal_t *signal)
+{
+    if (signal->state != HUMAN_ABSENT && signal->state != HUMAN_PRESENT) {
+        return -1;
+    }
+    if (signal->confidence < AC_MIN_CONFIDENCE) {
+        return 0;
+    }
+
+    if (signal->state == HUMAN_PRESENT) {
+        controller->absent_pending = false;
+        return (int)ac_controller_set_power(controller, AC_POWER_ON, signal->timestamp_ms);
+    }
+
+    if (!controller->absent_pending) {
+        controller->absent_pending = true;
+        controller->absent_since_ms = signal->timestamp_ms;
+    }
+    if ((uint32_t)(signal->timestamp_ms - controller->absent_since_ms) >= controller->absent_delay_ms) {
+        return (int)ac_controller_set_power(controller, AC_POWER_OFF, signal->timestamp_ms);
+    }
+    return 0;
+}
+
+static int ac_controller_poll(ac_controller_t *controller)
+{
+    human_detection_signal_t signal;
+
+    if (human_sensor_read(&signal) != 0) {
+        return -1;
+    }
+    return ac_controller_on_signal(controller, &signal);
+}
+
+/* ==================== 5. 自测与演示 ==================== */
+
+#define CHECK(cond, message)                              \
+    do {                                                  \
+        if (!(cond)) {                                    \
+            fprintf(stderr, "[FAIL] %s\n", (message));    \
+            return 1;                                     \
+        }                                                 \
+    } while (0)
+
+static int test_human_sensor(void)
+{
+    human_detection_signal_t signal;
+
+    human_sensor_reset();
+    CHECK(human_sensor_read(&signal) != 0, "empty sensor should report no sample");
+
+    human_sensor_feed(HUMAN_PRESENT, 90U, 1000U);
+    CHECK(human_sensor_read(&signal) == 0 && signal.state == HUMAN_PRESENT &&
+              signal.confidence == 90U && signal.timestamp_ms == 1000U,
+          "sensor sample mismatch");
+
+    human_sensor_feed(HUMAN_ABSENT, 200U, 2000U);
+    CHECK(human_sensor_read(&signal) == 0 && signal.state == HUMAN_PRESENT,
+          "invalid sample must be rejected");
+
+    printf("[PASS] human_sensor: read / feed / invalid-sample rejection\n");
+    return 0;
+}
+
+static int test_ir_transmit(void)
+{
+    ir_capture_t capture;
+    ir_sink_t sink;
+    ir_frame_t decoded;
+    const ir_segment_t *segment;
+
+    ir_capture_init(&capture);
+    sink = ir_capture_sink(&capture);
+
+    CHECK(IR_CARRIER_HZ == 38000U, "carrier must be 38kHz");
+    CHECK(ir_frame_inverted_command(0x01U) == 0xFEU, "inverted command byte incorrect");
+
+    CHECK(ir_driver_send_power(&sink, IR_AC_ADDRESS, AC_IR_CMD_POWER_ON) == IR_OK,
+          "send POWER_ON failed");
+    CHECK(!ir_capture_overflow(&capture), "capture buffer overflow");
+    CHECK(ir_capture_count(&capture) == 2U + 2U * IR_FRAME_BITS + 1U,
+          "unexpected pulse segment count");
+
+    segment = ir_capture_at(&capture, 0U);
+    CHECK(segment != NULL && segment->kind == IR_SEG_MARK &&
+              segment->duration_us == IR_LEADER_MARK_US, "leader mark incorrect");
+    segment = ir_capture_at(&capture, 1U);
+    CHECK(segment != NULL && segment->kind == IR_SEG_SPACE &&
+              segment->duration_us == IR_LEADER_SPACE_US, "leader space incorrect");
+
+    CHECK(ir_capture_decode_frame(&capture, &decoded) == 0, "emitted frame cannot be decoded");
+    CHECK(decoded.address == IR_AC_ADDRESS, "decoded address mismatch");
+    CHECK(decoded.command == (uint8_t)AC_IR_CMD_POWER_ON, "decoded POWER_ON command mismatch");
+    printf("[PASS] ir_transmit: 38kHz carrier, 9000us leader, 32-bit frame, addr=0x%04X cmd=0x%02X\n",
+           (unsigned)decoded.address, (unsigned)decoded.command);
+
+    ir_capture_init(&capture);
+    CHECK(ir_driver_send_power(&sink, IR_AC_ADDRESS, AC_IR_CMD_POWER_OFF) == IR_OK,
+          "send POWER_OFF failed");
+    CHECK(ir_capture_decode_frame(&capture, &decoded) == 0, "POWER_OFF frame cannot be decoded");
+    CHECK(decoded.command == (uint8_t)AC_IR_CMD_POWER_OFF, "decoded POWER_OFF command mismatch");
+    printf("[PASS] ir_transmit: addr=0x%04X cmd=0x%02X (checksum 0x%02X)\n",
+           (unsigned)decoded.address, (unsigned)decoded.command,
+           (unsigned)ir_frame_inverted_command(decoded.command));
+
+    ir_capture_init(&capture);
+    CHECK(ir_driver_send_power(NULL, IR_AC_ADDRESS, AC_IR_CMD_POWER_ON) == IR_ERR_INVALID_ARG,
+          "NULL sink must be rejected");
+    CHECK(ir_driver_send_power(&sink, IR_AC_ADDRESS, (ac_ir_command_t)0x99U) == IR_ERR_INVALID_ARG,
+          "unknown command must be rejected");
+    CHECK(ir_driver_send_frame(&sink, NULL) == IR_ERR_INVALID_ARG, "NULL frame must be rejected");
+    CHECK(ir_capture_count(&capture) == 0U, "invalid request must not emit pulses");
+    printf("[PASS] ir_transmit: invalid arguments emit nothing\n");
+
+    return 0;
+}
+
+static int test_occupancy(void)
+{
+    ir_capture_t capture;
+    ir_sink_t sink;
+    ac_controller_t controller;
+    ir_frame_t decoded;
+
+    human_sensor_reset();
+    ir_capture_init(&capture);
+    sink = ir_capture_sink(&capture);
+    ac_controller_init(&controller, &sink, IR_AC_ADDRESS);
+    ac_controller_configure(&controller, 5000U, 1000U);
+
+    CHECK(controller.power == AC_POWER_OFF, "initial power state must be OFF");
+    CHECK(ac_controller_poll(&controller) == -1, "empty sensor must report no signal");
+    CHECK(controller.transmit_count == 0U, "no signal must not transmit");
+    printf("[PASS] occupancy: no sensor data -> no action\n");
+
+    human_sensor_feed(HUMAN_PRESENT, 90U, 1000U);
+    CHECK(ac_controller_poll(&controller) == 0, "presence handling failed");
+    CHECK(controller.power == AC_POWER_ON && controller.transmit_count == 1U,
+          "presence must turn AC on");
+    CHECK(ir_capture_decode_frame(&capture, &decoded) == 0 &&
+              decoded.command == (uint8_t)AC_IR_CMD_POWER_ON,
+          "presence must emit POWER_ON infrared code");
+    printf("[PASS] occupancy: PRESENT at t=1000ms -> POWER_ON infrared code\n");
+
+    ir_capture_init(&capture);
+    human_sensor_feed(HUMAN_PRESENT, 90U, 1500U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.transmit_count == 1U,
+          "repeated presence must not re-transmit");
+    CHECK(ir_capture_count(&capture) == 0U, "duplicate frame emitted");
+    printf("[PASS] occupancy: repeated PRESENT -> state de-duplication\n");
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 2000U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.power == AC_POWER_ON,
+          "absence inside delay window must keep AC on");
+    CHECK(ir_capture_count(&capture) == 0U, "frame emitted inside delay window");
+    printf("[PASS] occupancy: ABSENT at t=2000ms -> still ON (5s delay window)\n");
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 4000U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.power == AC_POWER_ON,
+          "absence at t=4000ms must still keep AC on");
+    printf("[PASS] occupancy: ABSENT at t=4000ms -> still ON (window not expired)\n");
+
+    human_sensor_feed(HUMAN_PRESENT, 90U, 4500U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.transmit_count == 1U,
+          "re-detection must cancel absence timer");
+    printf("[PASS] occupancy: PRESENT at t=4500ms -> absence timer cancelled\n");
+
+    human_sensor_feed(HUMAN_ABSENT, 40U, 5000U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.power == AC_POWER_ON,
+          "low-confidence sample must be ignored");
+    CHECK(!controller.absent_pending, "low-confidence sample must not start absence timer");
+    printf("[PASS] occupancy: confidence=40 -> ignored, timer not started\n");
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 6000U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.absent_pending,
+          "valid absence sample must start timer");
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 11000U);
+    CHECK(ac_controller_poll(&controller) == 0, "absence timeout handling failed");
+    CHECK(controller.power == AC_POWER_OFF && controller.transmit_count == 2U,
+          "absence timeout must turn AC off");
+    CHECK(ir_capture_decode_frame(&capture, &decoded) == 0 &&
+              decoded.command == (uint8_t)AC_IR_CMD_POWER_OFF,
+          "absence timeout must emit POWER_OFF infrared code");
+    printf("[PASS] occupancy: ABSENT until t=11000ms -> POWER_OFF infrared code\n");
+
+    ir_capture_init(&capture);
+    human_sensor_feed(HUMAN_ABSENT, 90U, 11500U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.transmit_count == 2U,
+          "repeated absence must not re-transmit");
+    CHECK(ir_capture_count(&capture) == 0U, "duplicate frame emitted");
+    printf("[PASS] occupancy: repeated ABSENT -> state de-duplication\n");
+
+    human_sensor_feed(HUMAN_PRESENT, 90U, 12000U);
+    CHECK(ac_controller_poll(&controller) == 0 && controller.power == AC_POWER_ON &&
+              controller.transmit_count == 3U, "returning person must turn AC on again");
+    CHECK(ir_capture_decode_frame(&capture, &decoded) == 0 &&
+              decoded.command == (uint8_t)AC_IR_CMD_POWER_ON,
+          "return must emit POWER_ON infrared code");
+    printf("[PASS] occupancy: PRESENT again at t=12000ms -> POWER_ON infrared code\n");
+
+    human_sensor_reset();
+    ir_capture_init(&capture);
+    ac_controller_init(&controller, &sink, IR_AC_ADDRESS);
+    ac_controller_configure(&controller, 0U, 1000U);
+    human_sensor_feed(HUMAN_PRESENT, 90U, 20000U);
+    CHECK(ac_controller_poll(&controller) == 0, "interval test setup failed");
+    ir_capture_init(&capture);
+    human_sensor_feed(HUMAN_ABSENT, 90U, 20100U);
+    CHECK(ac_controller_poll(&controller) == (int)IR_ERR_BUSY,
+          "command inside min interval must be rejected");
+    CHECK(controller.power == AC_POWER_ON && controller.transmit_count == 1U,
+          "rejected command must not change state");
+    CHECK(ir_capture_count(&capture) == 0U, "rejected command must not emit pulses");
+    printf("[PASS] occupancy: OFF at +100ms -> IR_ERR_BUSY, no pulse emitted\n");
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 21100U);
+    CHECK(ac_controller_poll(&controller) == 0, "command after min interval failed");
+    CHECK(controller.power == AC_POWER_OFF && controller.transmit_count == 2U,
+          "command after min interval must be executed");
+    CHECK(ir_capture_decode_frame(&capture, &decoded) == 0 &&
+              decoded.command == (uint8_t)AC_IR_CMD_POWER_OFF,
+          "delayed command must emit POWER_OFF infrared code");
+    printf("[PASS] occupancy: OFF at +1100ms -> POWER_OFF infrared code\n");
+
+    return 0;
+}
+
+static int demo(void)
+{
+    ir_capture_t capture;
+    ir_sink_t sink;
+    ac_controller_t controller;
+
+    ir_capture_init(&capture);
+    sink = ir_capture_sink(&capture);
+    ac_controller_init(&controller, &sink, IR_AC_ADDRESS);
+    ac_controller_configure(&controller, 5000U, 1000U);
+    human_sensor_reset();
+
+    printf("[demo] carrier=%luHz device=0x%04X absent_delay=5000ms min_interval=1000ms\n",
+           (unsigned long)IR_CARRIER_HZ, (unsigned)IR_AC_ADDRESS);
+
+    human_sensor_feed(HUMAN_PRESENT, 90U, 1000U);
+    CHECK(ac_controller_poll(&controller) == 0, "demo: presence handling failed");
+    printf("[demo] t=1000ms human=PRESENT           ac=%-3s ir_frames=%lu\n",
+           controller.power == AC_POWER_ON ? "ON" : "OFF",
+           (unsigned long)controller.transmit_count);
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 2000U);
+    CHECK(ac_controller_poll(&controller) == 0, "demo: absence handling failed");
+    printf("[demo] t=2000ms human=ABSENT (waiting)  ac=%-3s ir_frames=%lu\n",
+           controller.power == AC_POWER_ON ? "ON" : "OFF",
+           (unsigned long)controller.transmit_count);
+
+    human_sensor_feed(HUMAN_ABSENT, 90U, 8000U);
+    CHECK(ac_controller_poll(&controller) == 0, "demo: absence timeout failed");
+    printf("[demo] t=8000ms human=ABSENT (timeout)  ac=%-3s ir_frames=%lu\n",
+           controller.power == AC_POWER_ON ? "ON" : "OFF",
+           (unsigned long)controller.transmit_count);
+
+    return 0;
+}
+
+int main(void)
+{
+    if (test_human_sensor() != 0 || test_ir_transmit() != 0 ||
+        test_occupancy() != 0 || demo() != 0) {
+        return 1;
+    }
+    printf("ALL TESTS PASSED\n");
+    return 0;
+}
